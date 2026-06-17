@@ -11,6 +11,16 @@ from src.database import (
     close_trade,
     delete_trade,
     get_scanned_tickers,
+    get_connection,
+)
+
+# nouveau utils
+from src.live_utils import (
+    get_live_price,
+    get_price_series,
+    get_volume_series,
+    compute_live_metrics,
+    compute_decision_score,
 )
 
 COLUMNS = [
@@ -93,7 +103,6 @@ def calculate_stats(df, usdcad_rate):
 
 def show_journal(username):
     st.subheader("📓 Journal des Trades")
-
     init_db()
 
     # --- Taux de change ---
@@ -197,22 +206,82 @@ def show_journal(username):
                     st.error("Le Take Profit doit être supérieur au prix d'entrée.")
                 else:
                     add_trade(
-                        username, ticker, str(date_entree), prix_entree,
-                        stop_loss, take_profit, quantite, notes, devise
+                        ticker = ticker,
+                        date_entree = str(date_entree),
+                        prix_entree = prix_entree,
+                        stop_loss = stop_loss,
+                        take_profit = take_profit,
+                        quantite = quantite,
+                        username = username,
+                        notes = notes,
+                        devise = devise,
                     )
                     st.success(f"✅ Trade {ticker} ({devise}) sauvegardé !")
                     st.rerun()
 
-    # --- CHARGER LES TRADES ---
-    st.warning(f"DEBUG - username reçu: '{username}'")
-    rows = get_all_trades(username)
-    rows = get_all_trades(username)
+    # --- CHARGER LES TRADES (robuste) ---
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM trades WHERE LOWER(username) = LOWER(?) ORDER BY date_entree DESC", (username,))
+    rows = cursor.fetchall()
+    db_cols_real = [description[0] for description in cursor.description]
+    conn.close()
+
     if not rows:
         st.info("Aucun trade enregistré pour l'instant.")
         return
 
-    df = pd.DataFrame(rows, columns=COLUMNS)
-    df = df.drop(columns=["Créé le"])
+    df = pd.DataFrame(rows, columns=db_cols_real)
+
+    rename_map = {
+        "id": "ID",
+        "ticker": "Ticker",
+        "date_entree": "Date Entrée",
+        "prix_entree": "Prix Entrée ($)",
+        "stop_loss": "Stop Loss ($)",
+        "take_profit": "Take Profit ($)",
+        "quantite": "Qté",
+        "statut": "Statut",
+        "prix_sortie": "Prix Sortie ($)",
+        "date_sortie": "Date Sortie",
+        "notes": "Notes",
+        "created_at": "Créé le",
+        "devise": "Devise",
+        "username": "Username"
+    }
+
+    df = df.rename(columns=rename_map)
+
+    for c in COLUMNS:
+        if c not in df.columns:
+            df[c] = None
+
+    df = df[COLUMNS]
+
+    # Conserver la valeur brute telle que lue de la DB (string) pour affichage exact si besoin
+    if "Date Entrée" in df.columns:
+        df["Date Entrée Raw"] = df["Date Entrée"].astype(str).str[:10]
+
+    # -- Normaliser "Date Entrée" en date pure (YYYY-MM-DD) pour éviter les décalages timezone/heure --
+    if "Date Entrée" in df.columns:
+        try:
+            df["Date Entrée"] = pd.to_datetime(
+                df["Date Entrée"].astype(str).str[:10],
+                errors="coerce",
+                format="%Y-%m-%d"
+            ).dt.date
+        except Exception:
+            st.warning("Impossible de normaliser 'Date Entrée' — affichage possible incorrect.")
+
+    # Convert types
+    if "Qté" in df.columns:
+        df["Qté"] = pd.to_numeric(df["Qté"], errors="coerce").fillna(0).astype(int)
+    for col in ["Prix Entrée ($)", "Stop Loss ($)", "Take Profit ($)", "Prix Sortie ($)"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Keep a display copy
+    df_display = df.drop(columns=["Créé le"])
 
     # --- STATISTIQUES ---
     stats = calculate_stats(df, usdcad_rate)
@@ -257,48 +326,152 @@ def show_journal(username):
 
     st.divider()
 
-    # --- TRADES OUVERTS ---
-    open_trades = df[df["Statut"] == "Ouvert"]
+    # --- TRADES OUVERTS (avec decision engine) ---
+    def fmt_date_safe(d):
+        if d is None or (isinstance(d, float) and pd.isna(d)):
+            return "N/A"
+        if isinstance(d, pd.Timestamp):
+            try:
+                return pd.to_datetime(d).date().isoformat()
+            except Exception:
+                return str(d)
+        if isinstance(d, date):
+            return d.isoformat()
+        return str(d)
+
+    open_trades = df_display[df_display["Statut"] == "Ouvert"]
     if not open_trades.empty:
         st.subheader(f"🟡 Trades Ouverts ({len(open_trades)})")
-        for _, row in open_trades.iterrows():
-            devise_row = row.get("Devise", "USD")
-            with st.expander(
-                f"{row['Ticker']} ({devise_row}) — Entré le {row['Date Entrée']} à {row['Prix Entrée ($)']} ${devise_row}"
-            ):
-                col1, col2, col3, col4 = st.columns(4)
-                col1.write(f"**Stop Loss :** {row['Stop Loss ($)']} ${devise_row}")
-                col2.write(f"**Take Profit :** {row['Take Profit ($)']} ${devise_row}")
-                col3.write(f"**Quantité :** {row['Qté']}")
-                col4.write(f"**Devise :** {devise_row}")
-                if row["Notes"]:
-                    st.caption(f"📝 {row['Notes']}")
+        if st.button("🔄 Rafraîchir les prix live", key="refresh_live_prices_journal"):
+            st.experimental_rerun()
 
-                st.markdown("**Fermer ce trade :**")
-                with st.form(f"close_{row['ID']}"):
-                    c1, c2, c3 = st.columns(3)
-                    prix_sortie = c1.number_input(
-                        f"Prix de sortie (${devise_row})", min_value=0.01, step=0.01, key=f"ps_{row['ID']}"
+        # Précharger séries / volumes pour tickers uniques
+        tickers_needed = sorted(set(open_trades["Ticker"].dropna().astype(str).tolist()))
+        series_cache = {}
+        vol_cache = {}
+        for t in tickers_needed:
+            series_cache[t] = get_price_series(t, period="6mo", interval="1d")
+            vol_cache[t] = get_volume_series(t, period="3mo", interval="1d")
+
+        for idx, row in open_trades.iterrows():
+            ticker = str(row["Ticker"])
+            live_price, ts = get_live_price(ticker)
+            metrics = compute_live_metrics(row, live_price) if live_price is not None else None
+            price_series = series_cache.get(ticker, None)
+            volume_series = vol_cache.get(ticker, None)
+
+            # compute decision score + recommendation
+            score, diag, recommended = compute_decision_score(
+                row,
+                price_series=price_series,
+                live_price=live_price,
+                volume_series=volume_series
+            )
+
+            # Header & color badge
+            color_badge = "🟡"
+            if metrics:
+                if metrics["unrealized_pl"] > 0:
+                    color_badge = "🟢"
+                elif metrics["unrealized_pl"] < 0:
+                    color_badge = "🔴"
+
+            # Prefer the raw string date for header if available to avoid timezone shifts
+            raw_date = row.get("Date Entrée Raw")
+            if raw_date and isinstance(raw_date, str) and raw_date.strip():
+                header_date = raw_date.strip()[:10]
+            else:
+                header_date = fmt_date_safe(row.get("Date Entrée"))
+
+            header = f"{color_badge} {ticker} — Entré le {header_date} à {row['Prix Entrée ($)']} {row.get('Devise','')}"
+            with st.expander(header, expanded=False):
+                # Top line: price + score
+                c1, c2, c3 = st.columns([1.2, 1, 1])
+                if metrics:
+                    c1.metric("Prix live", f"{metrics['live_price']:.2f}", delta=f"{metrics['unrealized_pct']:.2f}%")
+                else:
+                    c1.info("Prix live indisponible")
+
+                # Score display
+                score_pct = int(score * 100)
+                if score >= 0.65:
+                    c2.success(f"Score: {score_pct}% — KEEP")
+                elif score >= 0.40:
+                    c2.warning(f"Score: {score_pct}% — CAUTION")
+                else:
+                    c2.error(f"Score: {score_pct}% — CLOSE")
+
+                # Recommended action
+                c3.markdown(f"**Recommandation :** **{recommended}**")
+
+                # Diagnostics summary
+                st.markdown("**Diagnostics**")
+                diag_cols = st.columns(3)
+                diag_cols[0].write(f"Entrée : {diag.get('entry', 'N/A')}")
+                diag_cols[0].write(f"Stop : {diag.get('stop', 'N/A')}")
+                diag_cols[1].write(f"P&L% : {diag.get('pl_pct', 0):+.2f}%")
+                diag_cols[1].write(f"Dist stop : {diag.get('dist_to_stop_pct', 0):+.2f}%")
+                diag_cols[2].write(f"EMA50 : {diag.get('ema50', 'N/A')}")
+                diag_cols[2].write(f"RSI : {diag.get('rsi', 'N/A')}")
+                st.write("Raisons principales :")
+                reasons = []
+                # Compose human reasons from diag
+                if diag.get("pl_pct", 0) < 0:
+                    reasons.append(f"Prix < entrée ({diag.get('pl_pct'):.2f}%)")
+                if diag.get("ema50") is not None and diag.get("live") < diag.get("ema50"):
+                    reasons.append("Sous EMA50 (tendance affaiblie)")
+                if diag.get("atr") is not None and diag.get("atr") > 0 and (diag.get("live") - diag.get("stop")) < diag.get("atr"):
+                    reasons.append("Stop trop serré vs ATR")
+                if diag.get("volume_penalty", 0) > 0:
+                    reasons.append("Volume élevé sur mouvement adverse")
+                if not reasons:
+                    reasons.append("Aucun signal critique détecté")
+
+                for r in reasons:
+                    st.info(r)
+
+                # Quick actions
+                st.markdown("---")
+                st.write("Actions rapides")
+                # Copy for broker
+                if st.button("Copier valeurs pour IBKR", key=f"copy_ibkr_{row['ID']}"):
+                    st.code(f"TICKER : {ticker}\nQUANTITÉ : {row['Qté']}\nORDRE : LIMIT @ {row['Prix Entrée ($)']}\nSTOP LOSS : {row['Stop Loss ($)']}\nTARGET : {row['Take Profit ($)']}")
+
+                # Action buttons: Tighten stop, Reduce position, Close
+                a1, a2, a3 = st.columns(3)
+                if a1.button("🔒 Tighten stop (breakeven+1%)", key=f"tighten_{row['ID']}"):
+                    new_stop = float(row["Prix Entrée ($)"])  # exemple : move to entry
+                    st.info(f"Nouvel stop proposé : {new_stop:.2f}. (A implémenter : update_trade_stop)")
+                if a2.button("➗ Réduire position 25%", key=f"reduce_{row['ID']}"):
+                    st.info("Action: réduire position de 25% manuellement dans le broker.")
+                if a3.button("⛔ Fermer maintenant", key=f"close_now_{row['ID']}"):
+                    st.warning("Utilise la section 'Fermer ce trade' ci‑dessous pour enregistrer la fermeture.")
+
+                # Close form (identique à ton existing close form)
+                st.markdown("---")
+                with st.form(f"close_{row['ID']}", clear_on_submit=False):
+                    f1, f2, f3 = st.columns(3)
+                    prix_sortie = f1.number_input(
+                        f"Prix de sortie ({row.get('Devise','')})", min_value=0.01, step=0.01, key=f"ps_{row['ID']}"
                     )
-                    date_sortie = c2.date_input(
+                    date_sortie = f2.date_input(
                         "Date de sortie", value=date.today(), key=f"ds_{row['ID']}"
                     )
-                    statut_sortie = c3.selectbox(
+                    statut_sortie = f3.selectbox(
                         "Résultat", ["Gagné", "Perdu"], key=f"st_{row['ID']}"
                     )
-
                     c_close, c_delete = st.columns(2)
                     if c_close.form_submit_button("✅ Fermer le trade", use_container_width=True):
                         close_trade(row["ID"], prix_sortie, str(date_sortie), statut_sortie)
                         st.success("Trade fermé !")
-                        st.rerun()
+                        st.experimental_rerun()
                     if c_delete.form_submit_button("🗑️ Supprimer", use_container_width=True):
                         delete_trade(row["ID"])
                         st.warning("Trade supprimé.")
-                        st.rerun()
+                        st.experimental_rerun()
 
     # --- HISTORIQUE ---
-    closed_trades = df[df["Statut"].isin(["Gagné", "Perdu"])]
+    closed_trades = df_display[df_display["Statut"].isin(["Gagné", "Perdu"])]
     if not closed_trades.empty:
         st.divider()
         st.subheader(f"📋 Historique ({len(closed_trades)} trades fermés)")

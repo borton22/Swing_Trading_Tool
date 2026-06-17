@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 data/market_data.db
 .DS_Store
+.idea/
+src/.idea/
+*.iml

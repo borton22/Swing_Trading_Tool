@@ -18,7 +18,7 @@ from config import UNIVERSE, CAPITAL_INITIAL, RISK_PER_TRADE, USERS
 
 init_db()
 
-st.set_page_config(page_title="Swing Trader Quebec", layout="wide")
+st.set_page_config(page_title="Swing Trader Decision Tool", layout="wide")
 
 # ==================== AUTHENTIFICATION ====================
 import streamlit_authenticator as stauth
@@ -148,6 +148,52 @@ def get_smart_verdict(live_p, stop, target, gap, max_gap):
         return "🟠 R:R Limite", rr
     else:
         return "🔴 R:R Insuffisant", rr
+
+def get_confidence_score(rr, gap, max_gap):
+    score = 0
+
+    # R:R
+    if rr >= 2.0:
+        score += 30
+    elif rr >= 1.3:
+        score += 15
+
+    # Gap
+    if abs(gap) < 0.5:
+        score += 20
+    elif abs(gap) < max_gap:
+        score += 10
+
+    # Momentum positif léger
+    if 0 < gap < max_gap:
+        score += 10
+
+    # Tendance (R:R > 2 implique déjà un bon setup)
+    if rr >= 2.0:
+        score += 25
+    elif rr >= 1.3:
+        score += 15
+
+    return min(score, 100)
+
+
+def get_action(score, rr, hour_ny):
+    if rr < 1.3:
+        return "🔴 Ignorer"
+    if score >= 75:
+        if 15.5 <= hour_ny < 16.0:
+            return "✅ Acheter"
+        elif 9.5 <= hour_ny < 15.5:
+            return "🔵 Revoir à 15h30"
+        else:
+            return "🟡 Préparer ordre"
+    elif score >= 50:
+        if 15.5 <= hour_ny < 16.0:
+            return "🟡 Attendre"
+        else:
+            return "🔵 Revoir à 15h30"
+    else:
+        return "🔴 Ignorer"
 
 
 def pick_last_completed_row(df: pd.DataFrame) -> pd.Series | None:
@@ -325,7 +371,7 @@ for ticker in UNIVERSE:
 # ==================== ONGLETS ====================
 tab1, tab2, tab3, tab4 = st.tabs([
     "🔍 Scanner & Signaux",
-    "☀️ Préparation Matinale",
+    "🎯 Tableau de Décision",
     "📓 Journal des Trades",
     "📚 Guide & Logique"
 ])
@@ -393,11 +439,11 @@ with tab1:
             )
 
 
-# ==================== ONGLET 2 : PRÉPARATION MATINALE ====================
+# ==================== ONGLET 2 : Tableau de Décision ====================
 with tab2:
 
-    st.subheader("☀️ Préparation Matinale — Validation des Signaux")
-    st.caption("À utiliser entre 8h00 et 9h30 (heure de New York) pour valider les signaux de la veille.")
+    st.subheader("🎯 Tableau de Décision — Que faire maintenant ?")
+    st.caption("Rafraîchis à tout moment de la journée pour obtenir la meilleure décision selon l'heure NY.")
 
     if 4.0 <= hour_ny < 9.5:
         st.info(f"🟡 Pré-market actif ({now_ny.strftime('%H:%M')} NY)")
@@ -438,17 +484,22 @@ with tab2:
                 sizing = calculate_position_size(capital, risk, live_p, stop)
                 shares = sizing["shares"] if ("Idéale" in verdict or "Acceptable" in verdict) else 0
 
+                conf  = get_confidence_score(rr_val, gap, max_gap) if rr_val > 0 else 0
+                action = get_action(conf, rr_val, hour_ny)
+
                 morning_data.append({
-                    "Ticker":        ticker,
-                    "Clôture ($)":   entry_close,
-                    "Prix Live ($)": round(live_p, 2),
-                    "Source":        source,
-                    "Gap (%)":       round(gap, 2),
-                    "Stop ($)":      round(stop, 2),
-                    "Objectif ($)":  round(target, 2),
-                    "R:R Actuel":    round(rr_val, 2) if rr_val > 0 else "—",
-                    "Qté":           shares,
-                    "Verdict":       verdict,
+                    "Ticker":          ticker,
+                    "Clôture ($)":     entry_close,
+                    "Prix Live ($)":   round(live_p, 2),
+                    "Source":          source,
+                    "Gap (%)":         round(gap, 2),
+                    "Stop ($)":        round(stop, 2),
+                    "Objectif ($)":    round(target, 2),
+                    "R:R Actuel":      round(rr_val, 2) if rr_val > 0 else "—",
+                    "Confiance (%)":   conf,
+                    "Action":          action,
+                    "Qté":             shares,
+                    "Verdict":         verdict,
                 })
             else:
                 morning_data.append({
@@ -480,7 +531,8 @@ with tab2:
         col_s4.metric("🔴 À éviter",        nb_eviter)
 
         st.divider()
-        st.markdown("### 💡 Conseils du Moment")
+        st.divider()
+        st.markdown("### 🎯 Priorités d'Exécution")
 
         valid_rows = [
             x for x in morning_data
@@ -488,25 +540,38 @@ with tab2:
         ]
 
         if not valid_rows:
-            st.info("🤷 Aucun signal actionnable en ce moment. Patience.")
+            st.info("🤷 Aucun signal actionnable pour le moment. Patience.")
         else:
-            for row in valid_rows:
-                try:
-                    live_p  = float(row["Prix Live ($)"])
-                    rr_val  = float(row["R:R Actuel"])
-                except Exception:
-                    continue
+            valid_rows = sorted(valid_rows, key=lambda x: x["Confiance (%)"], reverse=True)
+            c1, c2 = st.columns(2)
 
-                advice = get_timing_advice(
-                    ticker      = row["Ticker"],
-                    live_p      = live_p,
-                    entry_close = float(row["Clôture ($)"]),
-                    stop        = float(row["Stop ($)"]),
-                    target      = float(row["Objectif ($)"]),
-                    rr          = rr_val,
-                    hour_ny     = hour_ny
-                )
-                show_advice_box(advice, row["Ticker"])
+            for i, row in enumerate(valid_rows):
+                target_col = c1 if i % 2 == 0 else c2
+
+                with target_col:
+                    if "Acheter" in row["Action"]:
+                        b_color = "#28a745"
+                        bg_color = "#f8fff9"
+                    elif "Revoir" in row["Action"]:
+                        b_color = "#007bff"
+                        bg_color = "#f0f7ff"
+                    elif "Préparer" in row["Action"]:
+                        b_color = "#ffc107"
+                        bg_color = "#fffdf5"
+                    else:
+                        b_color = "#dc3545"
+                        bg_color = "#fff5f5"
+
+                    st.markdown(f"""
+                    <div style="border-left: 5px solid {b_color}; background-color: {bg_color}; padding: 15px; border-radius: 5px; margin-bottom: 10px; box-shadow: 2px 2px 5px rgba(0,0,0,0.05);">
+                        <h4 style="margin:0; color:#31333F;">{row['Ticker']}</h4>
+                        <p style="margin:5px 0; font-weight:bold; color:{b_color};">{row['Action']}</p>
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <span style="font-size: 0.9em;">Confiance : <b>{row['Confiance (%)']}%</b></span>
+                            <span style="font-size: 0.8em; color:gray;">{row['Prix Live ($)']}$</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
         st.divider()
         st.markdown("### 🎯 Plan d'exécution détaillé")

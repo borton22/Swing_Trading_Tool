@@ -1,79 +1,74 @@
 # config.py
 import os
+from pathlib import Path
 
 # ============================================================
 # CHEMINS
 # ============================================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-DB_PATH  = os.path.join(DATA_DIR, "market_data.db")
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DB_PATH = DATA_DIR / "market_data.db"
 
 # ============================================================
 # PARAMÈTRES DE TÉLÉCHARGEMENT
 # ============================================================
 START_DATE = "2022-01-01"   # Historique depuis cette date
-INTERVAL   = "1d"           # Bougie journalière
+INTERVAL = "1d"             # Bougie journalière
 
 # ============================================================
 # PARAMÈTRES DE TRADING
 # ============================================================
-CAPITAL_INITIAL  = 10000.0  # Capital de départ ($)
-RISK_PER_TRADE   = 0.005    # Risque par trade (0.5% = 0.005)
+CAPITAL_INITIAL = 10000.0  # Capital de départ ($)
+RISK_PER_TRADE = 0.005     # Risque par trade (0.5% = 0.005)
 
 # ============================================================
 # UNIVERS DE TRADING (~50 tickers)
 # ============================================================
 UNIVERSE = [
-    # Market ETFs
     "SPY", "QQQ", "IWM",
-
-    # Sector ETFs
     "XLK", "XLF", "XLE", "XLV", "XLI",
-
-    # Mega-cap / Core
     "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA",
     "JPM", "V", "UNH",
-
-    # Semis / Hardware
     "AMD", "AVGO", "QCOM", "TXN", "MU", "AMAT", "INTC", "CSCO",
-
-    # Software / Cloud / Cyber
     "ADBE", "CRM", "ORCL", "NOW", "SNOW", "PANW", "CRWD",
-
-    # Consumer / Media / Retail
     "NFLX", "DIS", "WMT", "COST", "TGT", "HD", "NKE", "SBUX", "MCD",
-
-    # Healthcare
     "LLY", "JNJ", "ABBV", "MRK", "PFE", "TMO",
-
-    # Financials
     "BAC", "WFC", "GS", "MS", "BLK", "AXP",
-
-    # Energy / Industrials
     "XOM", "CVX", "CAT", "DE", "BA", "GE", "HON", "UPS",
 ]
 
-# ============================================================
-# UTILISATEURS (ajoute/retire des users ici)
-# ============================================================
-import streamlit_authenticator as stauth
+# --- UTILISATEURS (authentification Streamlit) ---
+# NE PAS STOCKER de secrets en clair dans le repo public.
+# On charge les credentials depuis .users.json (git-ignored) ou depuis une variable d'environnement.
 
+import json
+
+# Emplacement du fichier .users.json (doit être git-ignoré)
+USERS_FILE = BASE_DIR / ".users.json"
+
+if USERS_FILE.exists():
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            USERS_CREDENTIALS = json.load(f)  # structure attendue: {"usernames": { ... }}
+    except Exception as e:
+        print(f"[config] Erreur lecture {USERS_FILE}: {e}")
+        USERS_CREDENTIALS = {"usernames": {}}
+else:
+    USERS_CREDENTIALS = {"usernames": {}}
+
+# Charger la clé de cookie depuis la variable d'environnement (ne pas hardcoder)
+COOKIE_KEY = os.environ.get("SWING_COOKIE_KEY")
+if not COOKIE_KEY:
+    print("Warning: SWING_COOKIE_KEY not set. Set it in your environment or in a non-committed .env file.")
+
+# Construire la variable USERS utilisée par le code existant (format compatible)
 USERS = {
     "credentials": {
-        "usernames": {
-            "FrankB": {
-                "name": "François Baron",
-                "password": stauth.Hasher.hash("FrankB123321"),
-            },
-            "Invite": {
-                "name": "Invite",
-                "password": stauth.Hasher.hash("Invite321321"),
-            },
-        }
+        "usernames": USERS_CREDENTIALS.get("usernames", {})
     },
     "cookie": {
         "name": "swing_trader_cookie",
-        "key": "xK9#mP2$qL7vRtNwZpYsAeBcDfGhJkLm",
+        "key": COOKIE_KEY,
         "expiry_days": 30,
     },
 }

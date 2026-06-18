@@ -1,50 +1,94 @@
-# src/dashboard.py
+# === Début propre : en-tête + auth (garder SEULEMENT ce bloc au début du fichier) ===
+import os
+import sys
+from pathlib import Path
+from datetime import datetime
+import pytz
+
 import streamlit as st
 import pandas as pd
-import sys
-import os
 import subprocess
-import pytz
-from datetime import datetime
+
+# Ajouter la racine du projet au PYTHONPATH
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Maintenant que le PYTHONPATH est correct, on peut importer utils
+from src.utils import safe_rerun
+
+# Page config (appelé une seule fois)
+st.set_page_config(page_title="Swing Trader Decision Tool", layout="wide")
+
+# ==================== AUTHENTIFICATION (stable, sans cache) ====================
+import streamlit_authenticator as stauth
+from config import USERS, COOKIE_KEY
+
+credentials = USERS.get("credentials", {})
+cookie_name = USERS.get("cookie", {}).get("name", "swing_trader_cookie")
+cookie_key = COOKIE_KEY or ""
+cookie_expiry = USERS.get("cookie", {}).get("expiry_days", 30)
+
+if not COOKIE_KEY:
+    st.warning("Attention : SWING_COOKIE_KEY non défini. Définis SWING_COOKIE_KEY en variable d'environnement pour sécuriser les cookies de session.")
+
+if "authenticator_obj" not in st.session_state:
+    try:
+        st.session_state["authenticator_obj"] = stauth.Authenticate(credentials, cookie_name, cookie_key, cookie_expiry)
+    except Exception:
+        st.session_state["authenticator_obj"] = stauth.Authenticate(
+            credentials,
+            cookie_name=cookie_name,
+            key=cookie_key,
+            cookie_expiry_days=cookie_expiry
+        )
+
+authenticator = st.session_state["authenticator_obj"]
+
+# Appel login (une seule fois)
+name = None
+auth_status = None
+username = None
+try:
+    name, auth_status, username = authenticator.login("Login", "main")
+except Exception:
+    authenticator.login(location="main")
+    auth_status = st.session_state.get("authentication_status")
+    username = st.session_state.get("username")
+    name = st.session_state.get("name")
+
+if auth_status is False:
+    st.error("❌ Nom d'utilisateur ou mot de passe incorrect.")
+    st.stop()
+elif auth_status is None:
+    st.warning("👆 Entrez vos identifiants pour accéder à l'application.")
+    st.stop()
+
+st.sidebar.write(f"Connecté en tant : {name} ({username})")
+
+# Logout : unique, clé explicite
+if st.sidebar.button("Se déconnecter", key="logout_btn"):
+    try:
+        authenticator.logout("main")
+    except Exception:
+        for k in ["authentication_status", "username", "name"]:
+            if k in st.session_state:
+                del st.session_state[k]
+    safe_rerun()
+# ==================== FIN AUTHENTIFICATION ====================
+
+# Imports locaux et init (après auth)
+from config import UNIVERSE, CAPITAL_INITIAL, RISK_PER_TRADE
 from src.collector import get_processed_data, get_live_price
 from src.signals import detect_pullback_setup, get_last_signal
 from src.sizer import calculate_position_size
 from src.database import init_db
 from src.journal import show_journal
-from config import UNIVERSE, CAPITAL_INITIAL, RISK_PER_TRADE, USERS
 
 init_db()
-
-st.set_page_config(page_title="Swing Trader Decision Tool", layout="wide")
-
-# ==================== AUTHENTIFICATION ====================
-import streamlit_authenticator as stauth
-
-authenticator = stauth.Authenticate(
-    USERS["credentials"],
-    USERS["cookie"]["name"],
-    USERS["cookie"]["key"],
-    USERS["cookie"]["expiry_days"]
-)
-
-# On appelle login, mais on ne récupère pas les variables ici
-authenticator.login(location="main")
-
-# On récupère le statut et les infos depuis l'objet lui-même
-auth_status = st.session_state.get("authentication_status")
-username    = st.session_state.get("username")
-name        = st.session_state.get("name")
-
-if auth_status is False:
-    st.error("❌ Nom d'utilisateur ou mot de passe incorrect.")
-    st.stop()
-
-elif auth_status is None:
-    st.warning("👆 Entrez vos identifiants pour accéder à l'application.")
-    st.stop()
+# === Fin du bloc initial ===
 
 # ==================== APP PRINCIPALE (si connecté) ====================
 st.title("📈 Swing Trader Dashboard")
@@ -52,7 +96,6 @@ st.title("📈 Swing Trader Dashboard")
 # --- BARRE LATÉRALE ---
 st.sidebar.header("Paramètres")
 st.sidebar.markdown(f"👤 **{name}**")
-authenticator.logout("🚪 Déconnexion", "sidebar")
 st.sidebar.divider()
 
 capital = st.sidebar.number_input(
@@ -93,7 +136,7 @@ if st.sidebar.button(
             )
             if result.returncode == 0:
                 st.sidebar.success("✅ Données mises à jour !")
-                st.rerun()
+                safe_rerun()
             else:
                 st.sidebar.error("❌ Erreur lors de la mise à jour.")
                 if result.stderr:
@@ -352,12 +395,17 @@ for ticker in UNIVERSE:
         atr   = float(last_row["atr14"])
         entry = float(last_row["close"])
         stop  = entry - (2 * atr)
+        
+        # --- AJOUT DE LA DEVISE ---
+        # Si le ticker finit par .TO ou .V, c'est du CAD, sinon USD
+        currency = "CAD" if ticker.endswith((".TO", ".V")) else "USD"
 
         sizing = calculate_position_size(capital, risk, entry, stop)
 
         if sizing["shares"] > 0:
             results.append({
                 "Ticker":             ticker,
+                "Devise":             currency,  # <-- Nouvelle colonne
                 "Entrée ($)":         round(entry, 2),
                 "Stop ($)":           round(stop, 2),
                 "Objectif ($)":       sizing["take_profit"],
@@ -463,7 +511,7 @@ with tab2:
         st.info("Aucun signal détecté. Rien à valider.")
     else:
         if st.button("🔄 Rafraîchir les prix live", use_container_width=False):
-            st.rerun()
+            safe_rerun()
 
         st.markdown("### 📋 Tableau de décision")
 

@@ -1,8 +1,12 @@
 venv/
+.env
 __pycache__/
 *.pyc
-data/market_data.db
-.DS_Store
+data/*.db
+market_data.db
+trading.db
+plots/
+*.png
+.vscode/
 .idea/
-src/.idea/
-*.iml
+.users.json

@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import yfinance as yf
+from src.utils import safe_rerun
 from datetime import date
 from src.database import (
     init_db,
@@ -217,7 +218,7 @@ def show_journal(username):
                         devise = devise,
                     )
                     st.success(f"✅ Trade {ticker} ({devise}) sauvegardé !")
-                    st.rerun()
+                    safe_rerun()
 
     # --- CHARGER LES TRADES (robuste) ---
     conn = get_connection()
@@ -343,7 +344,7 @@ def show_journal(username):
     if not open_trades.empty:
         st.subheader(f"🟡 Trades Ouverts ({len(open_trades)})")
         if st.button("🔄 Rafraîchir les prix live", key="refresh_live_prices_journal"):
-            st.experimental_rerun()
+            safe_rerun()
 
         # Précharger séries / volumes pour tickers uniques
         tickers_needed = sorted(set(open_trades["Ticker"].dropna().astype(str).tolist()))
@@ -464,11 +465,11 @@ def show_journal(username):
                     if c_close.form_submit_button("✅ Fermer le trade", use_container_width=True):
                         close_trade(row["ID"], prix_sortie, str(date_sortie), statut_sortie)
                         st.success("Trade fermé !")
-                        st.experimental_rerun()
+                        safe_rerun()
                     if c_delete.form_submit_button("🗑️ Supprimer", use_container_width=True):
                         delete_trade(row["ID"])
                         st.warning("Trade supprimé.")
-                        st.experimental_rerun()
+                        safe_rerun()
 
     # --- HISTORIQUE ---
     closed_trades = df_display[df_display["Statut"].isin(["Gagné", "Perdu"])]
